@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.log
+.env
+accounts.json
+*.pyc
+.DS_Store
+*.bak
+filesystem_mcp.py
+tool_parser.py
+check_logic.py
+test_api.log
+deploy_new.log
+claude_webapi.egg-info/
