@@ -19,7 +19,11 @@ load_dotenv()
 app = FastAPI(title="Hermes Agentic Bridge v4.0")
 security = HTTPBearer()
 ACCOUNTS_FILE = "/home/joe1280/Claude-API/accounts.json"
-AUTH_TOKEN="sk-123456"
+AUTH_TOKEN = "sk-123456"
+
+# 账号轮询索引
+account_index = 0
+account_lock = asyncio.Lock()
 
 class ChatCompletionRequest(BaseModel):
     model: str = "claude-sonnet-4-6"
@@ -36,6 +40,16 @@ def format_openai_sse(content: str, model: str, finish_reason: Optional[str] = N
     }
     return f"data: {json.dumps(data)}\n\n"
 
+async def get_next_account():
+    global account_index
+    async with account_lock:
+        with open(ACCOUNTS_FILE, "r") as f:
+            accounts = json.load(f)
+        acc = accounts[account_index % len(accounts)]
+        account_index += 1
+        logger.info(f"Using account {account_index % len(accounts)} (Index: {account_index})")
+        return acc
+
 async def execute_bash(command: str) -> str:
     logger.info(f"Executing: {command}")
     try:
@@ -50,22 +64,17 @@ async def chat_completions(request: ChatCompletionRequest, token: str = Depends(
     if token.credentials != AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    with open(ACCOUNTS_FILE, "r") as f:
-        acc = json.load(f)[0]
-    
+    acc = await get_next_account()
     user_query = request.messages[-1].get("content", "")
 
     async def agent_generator():
         async with ClaudeClient(acc["session_key"], acc.get("org_id")) as client:
-            # --- 阶段 1: 提取指令 ---
             planner_prompt = f"User wants: {user_query}. If this requires system access, reply ONLY with a bash code block. If not, reply with 'NONE'."
             logger.info("Phase 1: Planning...")
-            
             plan_resp = await client.generate_content(planner_prompt, model=request.model)
-            plan_text = plan_resp.text
             
             execution_context = ""
-            match = re.search(r"```bash\n(.*?)\n```", plan_text, re.DOTALL)
+            match = re.search(r"```bash\n(.*?)\n```", plan_resp.text, re.DOTALL)
             if match:
                 command = match.group(1).strip()
                 yield format_openai_sse(f"🔍 [Executing]: `{command}`...\n", request.model)
@@ -73,29 +82,23 @@ async def chat_completions(request: ChatCompletionRequest, token: str = Depends(
                 execution_context = f"\nSystem execution result for `{command}`:\n{result}\n"
                 yield format_openai_sse(f"✅ [Result Received]\n", request.model)
             
-            # --- 阶段 2: 最终回复 ---
-            final_prompt = f"Context: {execution_context}\nUser asked: {user_query}\nTask: Provide the final answer based on the context. Be concise and direct."
+            final_prompt = f"Context: {execution_context}\nUser asked: {user_query}\nTask: Provide the final answer based on the context."
             logger.info("Phase 2: Answering...")
-            
             async for chunk in client.generate_content_stream(final_prompt, model=request.model):
                 yield format_openai_sse(chunk.text_delta, request.model)
             
             if execution_context:
                 yield format_openai_sse(f"\n\n```text\n{execution_context}\n```", request.model)
-        
         yield "data: [DONE]\n\n"
 
-    # 非流式处理逻辑修复
     if not request.stream:
         full_text = ""
         async with ClaudeClient(acc["session_key"], acc.get("org_id")) as client:
-            # 重复一遍 Agent 逻辑，但收集为完整文本
             planner_prompt = f"User wants: {user_query}. If this requires system access, reply ONLY with a bash code block. If not, reply with 'NONE'."
             plan_resp = await client.generate_content(planner_prompt, model=request.model)
-            plan_text = plan_resp.text
             
             execution_context = ""
-            match = re.search(r"```bash\n(.*?)\n```", plan_text, re.DOTALL)
+            match = re.search(r"```bash\n(.*?)\n```", plan_resp.text, re.DOTALL)
             if match:
                 command = match.group(1).strip()
                 full_text += f"🔍 [Executing]: `{command}`...\n"
@@ -106,7 +109,6 @@ async def chat_completions(request: ChatCompletionRequest, token: str = Depends(
             final_prompt = f"Context: {execution_context}\nUser asked: {user_query}\nTask: Provide the final answer based on the context."
             final_resp = await client.generate_content(final_prompt, model=request.model)
             full_text += final_resp.text
-            
             if execution_context:
                 full_text += f"\n\n```text\n{execution_context}\n```"
                 
